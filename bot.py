@@ -125,8 +125,15 @@ def main_menu_keyboard():
 def extras_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Add reqs", "➕ Add .env File"], 
-        ["📝 Type Env Vars"], # NEW BUTTON
+        ["📝 Type Env Vars"],
         ["🚀 RUN NOW", "🔙 Cancel"]
+    ], resize_keyboard=True)
+
+# New Keyboard for Git Workflow
+def git_extras_keyboard():
+    return ReplyKeyboardMarkup([
+        ["📝 Type Env Vars", "➕ Add .env File"],
+        ["📂 Select File to Run", "🔙 Cancel"]
     ], resize_keyboard=True)
 
 # --- HELPER: REQ FIXER ---
@@ -166,7 +173,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # --- CONVERSATION 1: UPLOAD FILE ---
-WAIT_PY, WAIT_EXTRAS, WAIT_ENV_TEXT = range(3) # Added State
+WAIT_PY, WAIT_EXTRAS, WAIT_ENV_TEXT = range(3)
 
 @restricted
 async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,8 +181,7 @@ async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAIT_PY
 
 async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🔙 Cancel": return await cancel(update, context)
+    if update.message.text == "🔙 Cancel": return await cancel(update, context)
 
     file = await update.message.document.get_file()
     fname = update.message.document.file_name
@@ -202,16 +208,12 @@ async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text
     if txt == "🚀 RUN NOW": return await execute_logic(update, context)
+    elif txt == "🔙 Cancel": return await cancel(update, context)
     
     elif txt == "📝 Type Env Vars":
         await update.message.reply_text(
-            "📝 **Type your Environment Variables below.**\n\n"
-            "Format:\n"
-            "`TOKEN=12345`\n"
-            "`API_KEY=abcdef`\n\n"
-            "_Send them in a single message._",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True)
+            "📝 **Type Env Variables**\n\nExample:\n`TOKEN = \"12345\"`\n`DEBUG=True`",
+            parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True)
         )
         return WAIT_ENV_TEXT
 
@@ -227,27 +229,28 @@ async def receive_env_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "🔙 Cancel": return await cancel(update, context)
     
-    target_id = context.user_data['target_id']
     work_dir = context.user_data['work_dir']
+    target_id = context.user_data['target_id']
     
-    # Determine .env path
-    prefix = target_id if context.user_data['type'] == 'file' else target_id.split("|")[0]
     if context.user_data['type'] == 'repo':
         env_path = os.path.join(work_dir, ".env")
+        next_markup = git_extras_keyboard() # Return to Git menu
+        next_state = WAIT_GIT_EXTRAS
     else:
+        prefix = target_id 
         env_path = os.path.join(work_dir, f"{prefix}.env")
-        
-    # Append to .env file
+        next_markup = extras_keyboard() # Return to Upload menu
+        next_state = WAIT_EXTRAS
+
     try:
         with open(env_path, "a") as f:
-            if os.path.getsize(env_path) > 0:
-                f.write("\n") # Ensure new line if file not empty
+            if os.path.getsize(env_path) > 0: f.write("\n")
             f.write(text)
-        await update.message.reply_text("✅ **Variables Saved!**\nAdd more or Run.", reply_markup=extras_keyboard())
+        await update.message.reply_text("✅ **Variables Saved!**", reply_markup=next_markup)
     except Exception as e:
-        await update.message.reply_text(f"❌ Error saving env: {e}", reply_markup=extras_keyboard())
+        await update.message.reply_text(f"❌ Error: {e}", reply_markup=next_markup)
         
-    return WAIT_EXTRAS
+    return next_state
 
 async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wait = context.user_data.get('wait')
@@ -272,8 +275,8 @@ async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("Next?", reply_markup=extras_keyboard())
     return WAIT_EXTRAS
 
-# --- CONVERSATION 2: GIT CLONE ---
-WAIT_URL, WAIT_SELECT_FILE = range(3, 5)
+# --- CONVERSATION 2: GIT CLONE (UPDATED) ---
+WAIT_URL, WAIT_GIT_EXTRAS, WAIT_GIT_ENV_TEXT, WAIT_SELECT_FILE = range(3, 7)
 
 @restricted
 async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,35 +299,91 @@ async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subprocess.check_call(["git", "clone", url, repo_path])
         await msg.edit_text("✅ **Cloned Successfully!**")
         
-        py_files = []
-        for root, dirs, files in os.walk(repo_path):
-            for file in files:
-                if file.endswith(".py"):
-                    rel_path = os.path.relpath(os.path.join(root, file), repo_path)
-                    py_files.append(rel_path)
-        
-        if not py_files:
-            await update.message.reply_text("❌ No .py files found.", reply_markup=main_menu_keyboard())
-            return ConversationHandler.END
-        
-        context.user_data['repo_path'] = repo_path
-        context.user_data['repo_name'] = repo_name
-        
+        # Auto install reqs
         req_path = os.path.join(repo_path, "requirements.txt")
         if os.path.exists(req_path):
             await update.message.reply_text("📦 Installing `requirements.txt`...")
             await install_requirements(req_path, update)
 
-        keyboard = []
-        for f in py_files[:10]:
-            keyboard.append([InlineKeyboardButton(f, callback_data=f"sel_py_{f}")])
+        context.user_data['repo_path'] = repo_path
+        context.user_data['repo_name'] = repo_name
+        # Note: We don't select the file yet. We ask for Env Vars first.
         
-        await update.message.reply_text("👇 **Select Main File:**", reply_markup=InlineKeyboardMarkup(keyboard))
-        return WAIT_SELECT_FILE
+        # Save placeholder target_id for Env saver to work (it uses repo name)
+        context.user_data['target_id'] = f"{repo_name}|PLACEHOLDER"
+        context.user_data['type'] = 'repo'
+        context.user_data['work_dir'] = repo_path
+        
+        await update.message.reply_text(
+            "⚙️ **Setup Environment**\n"
+            "Do you have environment variables (like Tokens)?\n"
+            "Add them now, or click 'Select File' to skip.",
+            reply_markup=git_extras_keyboard()
+        )
+        return WAIT_GIT_EXTRAS
 
     except Exception as e:
         await msg.edit_text(f"❌ Clone Failed: {e}")
         return ConversationHandler.END
+
+async def receive_git_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    if txt == "🔙 Cancel": return await cancel(update, context)
+    
+    elif txt == "📝 Type Env Vars":
+        await update.message.reply_text(
+            "📝 **Type Env Variables**\n\nExample:\n`TELEGRAM_BOT_TOKEN = \"12345\"`",
+            parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True)
+        )
+        return WAIT_GIT_ENV_TEXT
+
+    elif txt == "➕ Add .env File":
+        await update.message.reply_text("🔒 Send `.env` file.")
+        context.user_data['wait'] = 'env' # Reuses upload logic if we redirect? 
+        # Actually easier to handle here manually or reuse logic carefully.
+        # Let's handle generic file upload for Git in a dedicated step if needed, 
+        # but for simplicity, let's use a specific state or reuse receive_git_extra_files.
+        return WAIT_GIT_EXTRAS # Needs a handler for document
+
+    elif txt == "📂 Select File to Run":
+        return await show_file_selection(update, context)
+
+    return WAIT_GIT_EXTRAS
+
+async def receive_git_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Handle .env upload for Git
+    file = await update.message.document.get_file()
+    fname = update.message.document.file_name
+    work_dir = context.user_data['work_dir']
+    
+    if fname.endswith('.env'):
+        path = os.path.join(work_dir, ".env")
+        await file.download_to_drive(path)
+        await update.message.reply_text("✅ Env saved.", reply_markup=git_extras_keyboard())
+    else:
+        await update.message.reply_text("❌ Only .env files allowed here.")
+        
+    return WAIT_GIT_EXTRAS
+
+async def show_file_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    repo_path = context.user_data['repo_path']
+    py_files = []
+    for root, dirs, files in os.walk(repo_path):
+        for file in files:
+            if file.endswith(".py"):
+                rel_path = os.path.relpath(os.path.join(root, file), repo_path)
+                py_files.append(rel_path)
+    
+    if not py_files:
+        await update.message.reply_text("❌ No .py files found.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    keyboard = []
+    for f in py_files[:10]:
+        keyboard.append([InlineKeyboardButton(f, callback_data=f"sel_py_{f}")])
+    
+    await update.message.reply_text("👇 **Select Main File:**", reply_markup=InlineKeyboardMarkup(keyboard))
+    return WAIT_SELECT_FILE
 
 async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -370,9 +429,11 @@ async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(env_path):
         with open(env_path) as f:
             for l in f:
+                # Basic parsing for KEY="VALUE" or KEY=VALUE
                 if '=' in l and not l.strip().startswith('#'):
                     k,v = l.strip().split('=', 1)
-                    custom_env[k] = v.strip()
+                    v = v.strip().strip('"').strip("'") # Remove quotes if present
+                    custom_env[k.strip()] = v
 
     log_file_path = os.path.join(UPLOAD_DIR, f"{target_id.replace('|','_')}.log")
     log_file = open(log_file_path, "w")
@@ -546,13 +607,22 @@ if __name__ == '__main__':
         fallbacks=[CommandHandler('cancel', cancel), MessageHandler(filters.Regex("^🔙 Cancel$"), cancel)]
     )
 
-    # Git Handler
+    # Git Handler (UPDATED)
     conv_git = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🌐 Clone from Git$"), git_start)],
         states={
             WAIT_URL: [
                 MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_git_url)
+            ],
+            WAIT_GIT_EXTRAS: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.Regex("^(📝|➕|📂)"), receive_git_extras),
+                MessageHandler(filters.Document.FileExtension("env"), receive_git_extra_files)
+            ],
+            WAIT_GIT_ENV_TEXT: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_env_text)
             ],
             WAIT_SELECT_FILE: [CallbackQueryHandler(select_git_file)]
         },
