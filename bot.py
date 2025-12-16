@@ -28,7 +28,6 @@ USERS_FILE = "allowed_users.json"
 OWNERSHIP_FILE = "ownership.json"
 
 # Global State
-# running_processes = { "unique_id": {"process": subprocess, "log_path": "..."} }
 running_processes = {} 
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -52,7 +51,7 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- DATA MANAGEMENT (USERS & OWNERSHIP) ---
+# --- DATA MANAGEMENT ---
 
 def get_allowed_users():
     if not os.path.exists(USERS_FILE): return []
@@ -76,7 +75,6 @@ def remove_allowed_user(uid):
         return True
     return False
 
-# --- OWNERSHIP SYSTEM (THE FIX) ---
 def load_ownership():
     if not os.path.exists(OWNERSHIP_FILE): return {}
     try:
@@ -155,7 +153,12 @@ async def install_requirements(req_path, update):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 **Python & Git Hosting Bot**", reply_markup=main_menu_keyboard())
 
-# --- CONVERSATION 1: UPLOAD FILE (FIXED) ---
+# --- CANCEL HANDLER (Common) ---
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚫 Operation Cancelled.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+# --- CONVERSATION 1: UPLOAD FILE ---
 WAIT_PY, WAIT_EXTRAS = range(2)
 
 @restricted
@@ -170,16 +173,13 @@ async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not fname.endswith(".py"): return await update.message.reply_text("❌ Needs .py")
     
-    # CONFLICT CHECK: Check if file exists and belongs to someone else
     owner = get_owner(fname)
     if os.path.exists(os.path.join(UPLOAD_DIR, fname)) and owner and owner != uid and uid != ADMIN_ID:
-        await update.message.reply_text(f"❌ **File name taken!**\n`{fname}` is owned by another user.\nPlease rename your file and upload again.")
+        await update.message.reply_text(f"❌ **Taken!** `{fname}` is owned by another user.")
         return WAIT_PY
 
     path = os.path.join(UPLOAD_DIR, fname)
     await file.download_to_drive(path)
-    
-    # Save Ownership
     save_ownership(fname, uid, "file")
     
     context.user_data['type'] = 'file'
@@ -192,9 +192,7 @@ async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text
     if txt == "🚀 RUN NOW": return await execute_logic(update, context)
-    elif txt == "🔙 Cancel": 
-        await update.message.reply_text("Cancelled.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
+    # Note: Cancel is handled by Regex filter in conversation handler list below
     elif "reqs" in txt:
         await update.message.reply_text("📂 Send `requirements.txt`.")
         context.user_data['wait'] = 'req'
@@ -210,9 +208,6 @@ async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE
     fname = update.message.document.file_name
     target_id = context.user_data['target_id']
     work_dir = context.user_data['work_dir']
-    
-    # For single files, env/reqs are named "filename_req.txt"
-    # For repos, they might be in the root
     
     prefix = target_id if context.user_data['type'] == 'file' else target_id.split("|")[0]
     
@@ -239,17 +234,12 @@ async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
+    # Note: Cancel is handled by Regex filter in conversation handler list below
+
     if not url.startswith("http"): return await update.message.reply_text("❌ Invalid URL.")
     
     repo_name = url.split("/")[-1].replace(".git", "")
     repo_path = os.path.join(UPLOAD_DIR, repo_name)
-    uid = update.effective_user.id
-    
-    # Conflict check for Repos
-    # We check if any file inside this repo ID key exists in ownership, or simply check directory
-    # Simplified: If directory exists, check if we own it (via checking ownership of a dummy file or key)
-    # Actually, let's just use the repo name as a key check.
-    # Note: Complex to track folder ownership perfectly in simple script, but we rely on sub-files.
     
     msg = await update.message.reply_text(f"⏳ Cloning `{repo_name}`...")
     if os.path.exists(repo_path): shutil.rmtree(repo_path)
@@ -298,8 +288,6 @@ async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     
     unique_id = f"{repo_name}|{filename}"
-    
-    # Save Ownership
     save_ownership(unique_id, uid, "repo")
     
     context.user_data['type'] = 'repo'
@@ -310,41 +298,26 @@ async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"✅ Selected `{filename}`")
     return await execute_logic(update.callback_query, context)
 
-# --- EXECUTION LOGIC (FIXED) ---
+# --- EXECUTION ---
 async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Determine source
-    msg_func = update.message.reply_text if update.message else update.message.reply_text
-    if isinstance(update, Update) and update.callback_query:
-        msg_func = update.callback_query.message.reply_text
-
-    target_id = context.user_data.get('target_id')
+    msg_func = update.message.reply_text if update.message else update.callback_query.message.reply_text
     
-    # Fallback if coming from "Manage" menu
-    if not target_id:
-         target_id = context.user_data.get('fallback_id')
+    target_id = context.user_data.get('target_id', context.user_data.get('fallback_id'))
     
-    # Reconstruct paths based on ID type
-    if "|" in target_id: # Repo
+    if "|" in target_id:
         repo, file = target_id.split("|")
         work_dir = os.path.join(UPLOAD_DIR, repo)
         script_path = file
-    else: # Single File
+        env_path = os.path.join(work_dir, ".env")
+    else:
         work_dir = UPLOAD_DIR
         script_path = target_id
+        env_path = os.path.join(work_dir, f"{target_id}.env")
 
-    # Check running
     if target_id in running_processes and running_processes[target_id]['process'].poll() is None:
         await msg_func(f"⚠️ `{target_id}` is already running!", reply_markup=main_menu_keyboard())
         return ConversationHandler.END
 
-    # Load Env
-    # For single files: filename.env
-    # For repos: .env in repo root
-    if "|" in target_id:
-        env_path = os.path.join(work_dir, ".env")
-    else:
-        env_path = os.path.join(work_dir, f"{target_id}.env")
-        
     custom_env = os.environ.copy()
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -359,20 +332,12 @@ async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         proc = subprocess.Popen(
             ["python", "-u", script_path], 
-            env=custom_env, 
-            stdout=log_file, 
-            stderr=subprocess.STDOUT, 
-            cwd=work_dir, 
-            preexec_fn=os.setsid
+            env=custom_env, stdout=log_file, stderr=subprocess.STDOUT, 
+            cwd=work_dir, preexec_fn=os.setsid
         )
-        
-        running_processes[target_id] = {
-            "process": proc,
-            "log": log_file_path
-        }
+        running_processes[target_id] = {"process": proc, "log": log_file_path}
         
         await msg_func(f"🚀 **Started!**\nID: `{target_id}`\nPID: {proc.pid}")
-        
         await asyncio.sleep(3)
         if proc.poll() is not None:
             log_file.close()
@@ -383,60 +348,43 @@ async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg_func(f"🟢 **Running!**\n🔗 URL: `{url}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
     except Exception as e:
-        await msg_func(f"❌ Exec Error: {e}", reply_markup=main_menu_keyboard())
+        await msg_func(f"❌ Error: {e}", reply_markup=main_menu_keyboard())
         
     return ConversationHandler.END
 
-# --- LIST & MANAGE (PRIVACY FIXED) ---
+# --- LIST & MANAGE ---
 @restricted
 async def list_hosted(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    ownership_data = load_ownership()
-    
+    uid = update.effective_user.id
+    ownership = load_ownership()
     keyboard = []
     
-    # Loop through all owned records
-    for tid, meta in ownership_data.items():
+    for tid, meta in ownership.items():
         owner = meta.get("owner")
-        
-        # PRIVACY FILTER:
-        # Show if User is Admin OR User owns the file
-        if user_id == ADMIN_ID or user_id == owner:
+        if uid == ADMIN_ID or uid == owner:
             status = "🟢" if tid in running_processes and running_processes[tid]['process'].poll() is None else "🔴"
-            
-            # If Admin, show who owns it
             label = f"{status} {tid}"
-            if user_id == ADMIN_ID and user_id != owner:
-                label += f" (User: {owner})"
-                
+            if uid == ADMIN_ID and uid != owner: label += f" (User: {owner})"
             keyboard.append([InlineKeyboardButton(label, callback_data=f"man_{tid}")])
 
     if not keyboard:
-        await update.message.reply_text("📂 No hosted files found for you.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("📂 No hosted files.", reply_markup=main_menu_keyboard())
         return
 
-    await update.message.reply_text("📂 **Your Hosted Apps:**", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("📂 **Your Apps:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    
-    # ⚠️ FIX: Always answer query first to stop loading animation
     await query.answer()
-    
     data = query.data
     uid = update.effective_user.id
 
     if data.startswith("man_"):
         target_id = data.split("man_")[1]
-        
-        # Verify Ownership again (Security)
         owner = get_owner(target_id)
-        if uid != ADMIN_ID and uid != owner:
-            await query.message.reply_text("⛔ Not your file.")
-            return
+        if uid != ADMIN_ID and uid != owner: return await query.message.reply_text("⛔ Not yours.")
 
         is_running = target_id in running_processes and running_processes[target_id]['process'].poll() is None
-        
         text = f"⚙️ **Manage:** `{target_id}`\nStatus: {'🟢 Running' if is_running else '🔴 Stopped'}"
         btns = []
         if is_running:
@@ -444,10 +392,8 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             btns.append([InlineKeyboardButton("🔗 URL", callback_data=f"url_{target_id}")])
         else:
             btns.append([InlineKeyboardButton("🚀 Run", callback_data=f"rerun_{target_id}")])
-            
         btns.append([InlineKeyboardButton("📜 Logs", callback_data=f"log_{target_id}")])
         btns.append([InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{target_id}")])
-        
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
 
     elif data.startswith("stop_"):
@@ -456,59 +402,54 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.killpg(os.getpgid(running_processes[pid]['process'].pid), signal.SIGTERM)
             running_processes[pid]['process'].wait()
             await query.edit_message_text(f"🛑 Stopped `{pid}`")
-        else:
-            await query.edit_message_text(f"⚠️ `{pid}` is not running.")
             
     elif data.startswith("rerun_"):
-        target_id = data.split("rerun_")[1]
-        context.user_data['fallback_id'] = target_id
+        context.user_data['fallback_id'] = data.split("rerun_")[1]
         await query.delete_message()
-        # Mocking update to reuse execute logic
         await execute_logic(update, context)
 
     elif data.startswith("del_"):
         pid = data.split("del_")[1]
-        
-        # Stop if running
         if pid in running_processes:
             try: os.killpg(os.getpgid(running_processes[pid]['process'].pid), signal.SIGTERM)
             except: pass
             del running_processes[pid]
-            
-        # Delete Files and Ownership Record
         delete_ownership(pid)
         
-        if "|" in pid: # Repo
-            repo_name = pid.split("|")[0]
-            shutil.rmtree(os.path.join(UPLOAD_DIR, repo_name), ignore_errors=True)
-        else: # Single file
+        if "|" in pid: shutil.rmtree(os.path.join(UPLOAD_DIR, pid.split("|")[0]), ignore_errors=True)
+        else: 
             try: os.remove(os.path.join(UPLOAD_DIR, pid))
             except: pass
         
-        # Remove extras
         for ext in ['.env', '_req.txt', '.log']:
              extra = os.path.join(UPLOAD_DIR, pid + ext if ext != '_req.txt' else f"{pid}_req.txt")
              if os.path.exists(extra): os.remove(extra)
-
         await query.edit_message_text(f"🗑️ Deleted `{pid}`")
 
     elif data.startswith("log_"):
         pid = data.split("log_")[1]
-        log_path = os.path.join(UPLOAD_DIR, f"{pid.replace('|','_')}.log")
-        if os.path.exists(log_path):
-             await context.bot.send_document(chat_id=update.effective_chat.id, document=open(log_path, 'rb'))
-        else:
-             await query.message.reply_text("❌ No logs found.")
+        path = os.path.join(UPLOAD_DIR, f"{pid.replace('|','_')}.log")
+        if os.path.exists(path): await context.bot.send_document(chat_id=update.effective_chat.id, document=open(path, 'rb'))
+        else: await query.message.reply_text("❌ No logs.")
 
     elif data.startswith("url_"):
         pid = data.split("url_")[1]
-        url = f"{BASE_URL}/status?script={pid}"
-        await query.message.reply_text(f"🔗 `{url}`", parse_mode="Markdown")
+        await query.message.reply_text(f"🔗 `{BASE_URL}/status?script={pid}`", parse_mode="Markdown")
 
     elif data.startswith("sel_py_"):
         await select_git_file(update, context)
 
-# --- ADMIN COMMANDS ---
+# --- SYSTEM & ADMIN ---
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🆘 **Help & Support**\n\n"
+        "Contact the dev: @platoonleaderr\n\n"
+        "• **Upload File:** Host a single .py file.\n"
+        "• **Git Clone:** Host a repo from a public URL.\n"
+        "• **Manage:** Stop/Delete/Run your scripts.",
+        parse_mode="Markdown"
+    )
+
 @super_admin_only
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return await update.message.reply_text("Usage: `/add 123`")
@@ -528,10 +469,6 @@ async def server_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active = sum(1 for p in running_processes.values() if p['process'].poll() is None)
     await update.message.reply_text(f"📊 **Stats**\nCPU: {cpu}%\nRAM: {ram}%\nActive Apps: {active}", parse_mode="Markdown")
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚫 Cancelled.", reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
-
 if __name__ == '__main__':
     t = threading.Thread(target=run_flask)
     t.daemon = True
@@ -539,24 +476,34 @@ if __name__ == '__main__':
     
     app_bot = ApplicationBuilder().token(TOKEN).build()
     
-    # Upload Handler
+    # Upload Handler (Fixed Cancel)
     conv_file = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📤 Upload File$"), upload_start)],
         states={
-            WAIT_PY: [MessageHandler(filters.Document.FileExtension("py"), receive_py)],
-            WAIT_EXTRAS: [MessageHandler(filters.Regex("^(🚀|🔙|➕)"), receive_extras), MessageHandler(filters.Document.ALL, receive_extra_files)]
+            WAIT_PY: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel), # Priority Cancel
+                MessageHandler(filters.Document.FileExtension("py"), receive_py)
+            ],
+            WAIT_EXTRAS: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel), # Priority Cancel
+                MessageHandler(filters.Regex("^(🚀|➕)"), receive_extras), 
+                MessageHandler(filters.Document.ALL, receive_extra_files)
+            ]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel), MessageHandler(filters.Regex("^🔙 Cancel$"), cancel)]
     )
 
-    # Git Handler
+    # Git Handler (Fixed Cancel)
     conv_git = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🌐 Clone from Git$"), git_start)],
         states={
-            WAIT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_git_url)],
+            WAIT_URL: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel), # Priority Cancel
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_git_url)
+            ],
             WAIT_SELECT_FILE: [CallbackQueryHandler(select_git_file)]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel), MessageHandler(filters.Regex("^🔙 Cancel$"), cancel)]
     )
     
     app_bot.add_handler(CommandHandler('add', add_user))
@@ -565,6 +512,7 @@ if __name__ == '__main__':
     app_bot.add_handler(conv_git)
     app_bot.add_handler(MessageHandler(filters.Regex("^📂 My Hosted Apps$"), list_hosted))
     app_bot.add_handler(MessageHandler(filters.Regex("^📊 Server Stats$"), server_stats))
+    app_bot.add_handler(MessageHandler(filters.Regex("^🆘 Help$"), help_command))
     app_bot.add_handler(CallbackQueryHandler(manage_callback))
     app_bot.add_handler(CommandHandler('start', start))
 
