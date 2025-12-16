@@ -1,0 +1,518 @@
+import os
+import logging
+import asyncio
+import subprocess
+import signal
+import sys
+import psutil
+import json
+import threading
+import shutil
+from flask import Flask, request
+from datetime import datetime
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, CommandHandler, 
+    MessageHandler, filters, ConversationHandler, CallbackQueryHandler
+)
+
+# --- CONFIGURATION ---
+TOKEN = os.environ.get("TOKEN") 
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0")) 
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8080")
+
+UPLOAD_DIR = "scripts"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+USERS_FILE = "allowed_users.json"
+
+# Global State
+# running_processes = { "unique_id": {"process": subprocess, "path": "path/to/file", "type": "file/repo"} }
+running_processes = {} 
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- FLASK SERVER ---
+app = Flask(__name__)
+
+@app.route('/')
+def home(): return "🤖 Python Host Bot is Alive!", 200
+
+@app.route('/status')
+def script_status():
+    script_name = request.args.get('script')
+    if not script_name: return "Specify script", 400
+    
+    # Check if this ID exists in running processes
+    if script_name in running_processes and running_processes[script_name]['process'].poll() is None:
+        return f"✅ {script_name} is running.", 200
+    return f"❌ {script_name} is stopped.", 404
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# --- USER AUTH ---
+def get_allowed_users():
+    if not os.path.exists(USERS_FILE): return []
+    try:
+        with open(USERS_FILE, 'r') as f: return json.load(f)
+    except: return []
+
+def save_allowed_user(uid):
+    users = get_allowed_users()
+    if uid not in users:
+        users.append(uid)
+        with open(USERS_FILE, 'w') as f: json.dump(users, f)
+        return True
+    return False
+
+def remove_allowed_user(uid):
+    users = get_allowed_users()
+    if uid in users:
+        users.remove(uid)
+        with open(USERS_FILE, 'w') as f: json.dump(users, f)
+        return True
+    return False
+
+# --- DECORATORS ---
+def restricted(func):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        uid = update.effective_user.id
+        if uid != ADMIN_ID and uid not in get_allowed_users():
+            await update.message.reply_text("⛔ Access Denied.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+def super_admin_only(func):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if update.effective_user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Super Admin Only.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+# --- KEYBOARDS ---
+def main_menu_keyboard():
+    return ReplyKeyboardMarkup([
+        ["📤 Upload File", "🌐 Clone from Git"],
+        ["📂 My Hosted Apps", "📊 Server Stats"],
+        ["🆘 Help"]
+    ], resize_keyboard=True)
+
+def repo_setup_keyboard():
+    return ReplyKeyboardMarkup([
+        ["🚀 Run Repo", "🔙 Cancel"]
+    ], resize_keyboard=True)
+
+# --- HELPER: REQ FIXER ---
+def smart_fix_requirements(req_path):
+    try:
+        with open(req_path, 'r') as f: lines = f.readlines()
+        clean = []
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            if line.lower().startswith("pip install"):
+                clean.extend(line[11:].strip().split())
+            else:
+                clean.append(line)
+        with open(req_path, 'w') as f: f.write('\n'.join(clean))
+        return True
+    except: return False
+
+async def install_requirements(req_path, update):
+    msg = await update.message.reply_text("⏳ **Installing requirements...**")
+    smart_fix_requirements(req_path)
+    try:
+        proc = await asyncio.create_subprocess_exec("pip", "install", "-r", req_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0: await msg.edit_text("✅ **Installed!**")
+        else: await msg.edit_text(f"❌ Failed:\n```\n{stderr.decode()[-1000:]}\n```", parse_mode="Markdown")
+    except Exception as e: await msg.edit_text(f"❌ Error: {e}")
+
+# --- HANDLERS ---
+@restricted
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 **Python & Git Hosting Bot**", reply_markup=main_menu_keyboard())
+
+# --- CONVERSATION 1: UPLOAD FILE ---
+WAIT_PY, WAIT_EXTRAS = range(2)
+
+@restricted
+async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📤 Send `.py` file.", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True))
+    return WAIT_PY
+
+async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file = await update.message.document.get_file()
+    fname = update.message.document.file_name
+    if not fname.endswith(".py"): return await update.message.reply_text("❌ Needs .py")
+    
+    path = os.path.join(UPLOAD_DIR, fname)
+    await file.download_to_drive(path)
+    context.user_data['type'] = 'file'
+    context.user_data['target_id'] = fname # ID is filename
+    context.user_data['path'] = path
+    context.user_data['work_dir'] = UPLOAD_DIR
+    
+    await update.message.reply_text(f"✅ Saved. Add extras?", reply_markup=ReplyKeyboardMarkup([["➕ Add reqs", "➕ Add .env"], ["🚀 RUN NOW", "🔙 Cancel"]], resize_keyboard=True))
+    return WAIT_EXTRAS
+
+async def receive_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    if txt == "🚀 RUN NOW": return await execute_logic(update, context)
+    elif txt == "🔙 Cancel": 
+        await update.message.reply_text("Cancelled.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+    elif "reqs" in txt:
+        await update.message.reply_text("📂 Send `requirements.txt`.")
+        context.user_data['wait'] = 'req'
+    elif ".env" in txt:
+        await update.message.reply_text("🔒 Send `.env`.")
+        context.user_data['wait'] = 'env'
+    return WAIT_EXTRAS
+
+async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wait = context.user_data.get('wait')
+    if not wait: return WAIT_EXTRAS
+    file = await update.message.document.get_file()
+    fname = update.message.document.file_name
+    target_id = context.user_data['target_id']
+    work_dir = context.user_data['work_dir']
+    
+    if wait == 'req' and fname.endswith('.txt'):
+        path = os.path.join(work_dir, f"{target_id}_req.txt")
+        await file.download_to_drive(path)
+        await install_requirements(path, update)
+    elif wait == 'env' and fname.endswith('.env'):
+        path = os.path.join(work_dir, f"{target_id}.env")
+        await file.download_to_drive(path)
+        await update.message.reply_text("✅ Env saved.")
+    
+    context.user_data['wait'] = None
+    await update.message.reply_text("Next?", reply_markup=ReplyKeyboardMarkup([["➕ Add reqs", "➕ Add .env"], ["🚀 RUN NOW", "🔙 Cancel"]], resize_keyboard=True))
+    return WAIT_EXTRAS
+
+# --- CONVERSATION 2: GIT CLONE ---
+WAIT_URL, WAIT_SELECT_FILE = range(2, 4)
+
+@restricted
+async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🌐 **Send Public Git Repository URL**\n(e.g., https://github.com/user/repo)", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True))
+    return WAIT_URL
+
+async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    if not url.startswith("http"):
+        await update.message.reply_text("❌ Invalid URL.")
+        return WAIT_URL
+    
+    repo_name = url.split("/")[-1].replace(".git", "")
+    repo_path = os.path.join(UPLOAD_DIR, repo_name)
+    
+    msg = await update.message.reply_text(f"⏳ Cloning `{repo_name}`...")
+    
+    # Remove if exists
+    if os.path.exists(repo_path):
+        shutil.rmtree(repo_path)
+    
+    try:
+        subprocess.check_call(["git", "clone", url, repo_path])
+        await msg.edit_text("✅ **Cloned Successfully!**")
+        
+        # Scan for .py files
+        py_files = []
+        for root, dirs, files in os.walk(repo_path):
+            for file in files:
+                if file.endswith(".py"):
+                    # Get relative path from repo root
+                    rel_path = os.path.relpath(os.path.join(root, file), repo_path)
+                    py_files.append(rel_path)
+        
+        if not py_files:
+            await update.message.reply_text("❌ No .py files found in repo.", reply_markup=main_menu_keyboard())
+            return ConversationHandler.END
+        
+        context.user_data['repo_path'] = repo_path
+        context.user_data['repo_name'] = repo_name
+        
+        # Check for requirements.txt automatically
+        req_path = os.path.join(repo_path, "requirements.txt")
+        if os.path.exists(req_path):
+            await update.message.reply_text("📦 Found `requirements.txt`. Installing...")
+            await install_requirements(req_path, update)
+
+        # Create buttons to select main file
+        keyboard = []
+        for f in py_files[:10]: # Limit to 10 to avoid button overload
+            keyboard.append([InlineKeyboardButton(f, callback_data=f"sel_py_{f}")])
+        
+        await update.message.reply_text("👇 **Select the Main File to Run:**", reply_markup=InlineKeyboardMarkup(keyboard))
+        return WAIT_SELECT_FILE
+
+    except Exception as e:
+        await msg.edit_text(f"❌ Clone Failed: {e}")
+        return ConversationHandler.END
+
+async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    filename = query.data.split("sel_py_")[1]
+    repo_path = context.user_data['repo_path']
+    repo_name = context.user_data['repo_name']
+    
+    # Set up execution data
+    # Unique ID for a repo script is "repo_name/filename.py"
+    unique_id = f"{repo_name}|{filename}"
+    
+    context.user_data['type'] = 'repo'
+    context.user_data['target_id'] = unique_id
+    context.user_data['path'] = filename # Relative path inside repo
+    context.user_data['work_dir'] = repo_path
+    
+    await query.edit_message_text(f"✅ Selected `{filename}`")
+    
+    # Trigger execution
+    return await execute_logic(update.callback_query, context)
+
+# --- COMMON EXECUTION LOGIC ---
+async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Determine source (message or callback)
+    msg_func = update.message.reply_text if update.message else update.message.reply_text # Fallback
+    if isinstance(update, Update) and update.callback_query:
+        msg_func = update.callback_query.message.reply_text
+
+    target_id = context.user_data.get('target_id')
+    work_dir = context.user_data.get('work_dir')
+    script_path = context.user_data.get('path') # Relative filename
+    
+    if not target_id:
+         # Fallback for "My Files" run
+         target_id = context.user_data.get('fallback_id')
+         # We need to reconstruct paths based on stored ID
+         if "|" in target_id: # It's a repo
+             repo, file = target_id.split("|")
+             work_dir = os.path.join(UPLOAD_DIR, repo)
+             script_path = file
+         else: # It's a single file
+             work_dir = UPLOAD_DIR
+             script_path = target_id
+
+    # Check running
+    if target_id in running_processes and running_processes[target_id]['process'].poll() is None:
+        await msg_func(f"⚠️ `{target_id}` is already running!", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    # Load Env
+    env_path = os.path.join(work_dir, f"{target_id}.env") if "|" not in target_id else os.path.join(work_dir, ".env")
+    custom_env = os.environ.copy()
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for l in f:
+                if '=' in l and not l.strip().startswith('#'):
+                    k,v = l.strip().split('=', 1)
+                    custom_env[k] = v.strip()
+
+    log_file_path = os.path.join(UPLOAD_DIR, f"{target_id.replace('|','_')}.log")
+    log_file = open(log_file_path, "w")
+    
+    try:
+        # EXECUTE
+        # We run inside the 'work_dir' so imports work correctly
+        proc = subprocess.Popen(
+            ["python", "-u", script_path], 
+            env=custom_env, 
+            stdout=log_file, 
+            stderr=subprocess.STDOUT, 
+            cwd=work_dir, 
+            preexec_fn=os.setsid
+        )
+        
+        running_processes[target_id] = {
+            "process": proc,
+            "log": log_file_path
+        }
+        
+        await msg_func(f"🚀 **Started!**\nID: `{target_id}`\nPID: {proc.pid}")
+        
+        await asyncio.sleep(3)
+        if proc.poll() is not None:
+            log_file.close()
+            with open(log_file_path) as f: log = f.read()[-2000:]
+            await msg_func(f"❌ **Crashed:**\n`{log}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        else:
+            url = f"{BASE_URL}/status?script={target_id}"
+            await msg_func(f"🟢 **Running!**\n🔗 URL: `{url}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+    except Exception as e:
+        await msg_func(f"❌ Exec Error: {e}", reply_markup=main_menu_keyboard())
+        
+    return ConversationHandler.END
+
+# --- LIST & MANAGE ---
+@restricted
+async def list_hosted(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1. Single Files
+    files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.py')]
+    # 2. Repos (Folders)
+    repos = [d for d in os.listdir(UPLOAD_DIR) if os.path.isdir(os.path.join(UPLOAD_DIR, d))]
+    
+    keyboard = []
+    
+    # List Single Files
+    for f in files:
+        pid = f
+        status = "🟢" if pid in running_processes and running_processes[pid]['process'].poll() is None else "🔴"
+        keyboard.append([InlineKeyboardButton(f"📄 {status} {f}", callback_data=f"man_{pid}")])
+    
+    # List Running Repos (We only list running repos or we'd need a complex scanner)
+    # Simplified: Show active repo processes
+    for pid in running_processes:
+        if "|" in pid:
+            status = "🟢" if running_processes[pid]['process'].poll() is None else "🔴"
+            keyboard.append([InlineKeyboardButton(f"📦 {status} {pid}", callback_data=f"man_{pid}")])
+
+    if not keyboard:
+        await update.message.reply_text("📂 Nothing hosted.", reply_markup=main_menu_keyboard())
+        return
+
+    await update.message.reply_text("📂 **Hosted Apps:**", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    if data.startswith("man_"):
+        target_id = data.split("man_")[1]
+        is_running = target_id in running_processes and running_processes[target_id]['process'].poll() is None
+        
+        text = f"⚙️ **Manage:** `{target_id}`\nStatus: {'🟢 Running' if is_running else '🔴 Stopped'}"
+        btns = []
+        if is_running:
+            btns.append([InlineKeyboardButton("🛑 Stop", callback_data=f"stop_{target_id}")])
+            btns.append([InlineKeyboardButton("🔗 URL", callback_data=f"url_{target_id}")])
+        else:
+            btns.append([InlineKeyboardButton("🚀 Run", callback_data=f"rerun_{target_id}")])
+            
+        btns.append([InlineKeyboardButton("📜 Logs", callback_data=f"log_{target_id}")])
+        btns.append([InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{target_id}")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+
+    elif data.startswith("stop_"):
+        pid = data.split("stop_")[1]
+        if pid in running_processes:
+            os.killpg(os.getpgid(running_processes[pid]['process'].pid), signal.SIGTERM)
+            running_processes[pid]['process'].wait()
+            await query.edit_message_text(f"🛑 Stopped `{pid}`")
+            
+    elif data.startswith("rerun_"):
+        target_id = data.split("rerun_")[1]
+        context.user_data['fallback_id'] = target_id
+        await query.delete_message()
+        await execute_logic(update, context)
+
+    elif data.startswith("del_"):
+        pid = data.split("del_")[1]
+        # Stop if running
+        if pid in running_processes:
+            try: os.killpg(os.getpgid(running_processes[pid]['process'].pid), signal.SIGTERM)
+            except: pass
+            del running_processes[pid]
+            
+        # Delete Files
+        if "|" in pid: # It's a repo
+            repo_name = pid.split("|")[0]
+            shutil.rmtree(os.path.join(UPLOAD_DIR, repo_name), ignore_errors=True)
+        else: # Single file
+            try: os.remove(os.path.join(UPLOAD_DIR, pid))
+            except: pass
+            
+        await query.edit_message_text(f"🗑️ Deleted `{pid}`")
+
+    elif data.startswith("log_"):
+        pid = data.split("log_")[1]
+        # Log logic varies slightly for repos but we stored log path
+        log_path = os.path.join(UPLOAD_DIR, f"{pid.replace('|','_')}.log")
+        if os.path.exists(log_path):
+             await context.bot.send_document(chat_id=update.effective_chat.id, document=open(log_path, 'rb'))
+        else:
+             await query.message.reply_text("❌ No logs found.")
+
+    elif data.startswith("url_"):
+        pid = data.split("url_")[1]
+        url = f"{BASE_URL}/status?script={pid}"
+        await query.message.reply_text(f"🔗 `{url}`", parse_mode="Markdown")
+
+    elif data.startswith("sel_py_"):
+        # This handles the Git file selection
+        await select_git_file(update, context)
+
+# --- ADMIN COMMANDS (Same as before) ---
+@super_admin_only
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return await update.message.reply_text("Usage: `/add 123`")
+    if save_allowed_user(int(context.args[0])): await update.message.reply_text("✅ Added.")
+    else: await update.message.reply_text("⚠️ Exists.")
+
+@super_admin_only
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return await update.message.reply_text("Usage: `/remove 123`")
+    if remove_allowed_user(int(context.args[0])): await update.message.reply_text("🗑️ Removed.")
+    else: await update.message.reply_text("⚠️ Not found.")
+
+@restricted
+async def server_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cpu = psutil.cpu_percent()
+    ram = psutil.virtual_memory().percent
+    active = sum(1 for p in running_processes.values() if p['process'].poll() is None)
+    await update.message.reply_text(f"📊 **Stats**\nCPU: {cpu}%\nRAM: {ram}%\nActive Apps: {active}", parse_mode="Markdown")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚫 Cancelled.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+if __name__ == '__main__':
+    t = threading.Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+    
+    app_bot = ApplicationBuilder().token(TOKEN).build()
+    
+    # Upload Handler
+    conv_file = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📤 Upload File$"), upload_start)],
+        states={
+            WAIT_PY: [MessageHandler(filters.Document.FileExtension("py"), receive_py)],
+            WAIT_EXTRAS: [MessageHandler(filters.Regex("^(🚀|🔙|➕)"), receive_extras), MessageHandler(filters.Document.ALL, receive_extra_files)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+
+    # Git Handler
+    conv_git = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🌐 Clone from Git$"), git_start)],
+        states={
+            WAIT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_git_url)],
+            WAIT_SELECT_FILE: [CallbackQueryHandler(select_git_file)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    
+    app_bot.add_handler(CommandHandler('add', add_user))
+    app_bot.add_handler(CommandHandler('remove', remove_user))
+    app_bot.add_handler(conv_file)
+    app_bot.add_handler(conv_git)
+    app_bot.add_handler(MessageHandler(filters.Regex("^📂 My Hosted Apps$"), list_hosted))
+    app_bot.add_handler(MessageHandler(filters.Regex("^📊 Server Stats$"), server_stats))
+    app_bot.add_handler(CallbackQueryHandler(manage_callback))
+    app_bot.add_handler(CommandHandler('start', start))
+
+    print("Bot is up and running!")
+    app_bot.run_polling()
