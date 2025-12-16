@@ -122,6 +122,13 @@ def main_menu_keyboard():
         ["🆘 Help"]
     ], resize_keyboard=True)
 
+def extras_keyboard():
+    return ReplyKeyboardMarkup([
+        ["➕ Add reqs", "➕ Add .env File"], 
+        ["📝 Type Env Vars"], # NEW BUTTON
+        ["🚀 RUN NOW", "🔙 Cancel"]
+    ], resize_keyboard=True)
+
 # --- HELPER: REQ FIXER ---
 def smart_fix_requirements(req_path):
     try:
@@ -153,13 +160,13 @@ async def install_requirements(req_path, update):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 **Python & Git Hosting Bot**", reply_markup=main_menu_keyboard())
 
-# --- CANCEL HANDLER (Common) ---
+# --- CANCEL HANDLER ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Operation Cancelled.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
 # --- CONVERSATION 1: UPLOAD FILE ---
-WAIT_PY, WAIT_EXTRAS = range(2)
+WAIT_PY, WAIT_EXTRAS, WAIT_ENV_TEXT = range(3) # Added State
 
 @restricted
 async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,6 +174,9 @@ async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAIT_PY
 
 async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🔙 Cancel": return await cancel(update, context)
+
     file = await update.message.document.get_file()
     fname = update.message.document.file_name
     uid = update.effective_user.id
@@ -186,19 +196,57 @@ async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['target_id'] = fname 
     context.user_data['work_dir'] = UPLOAD_DIR
     
-    await update.message.reply_text(f"✅ Saved. Add extras?", reply_markup=ReplyKeyboardMarkup([["➕ Add reqs", "➕ Add .env"], ["🚀 RUN NOW", "🔙 Cancel"]], resize_keyboard=True))
+    await update.message.reply_text(f"✅ Saved. Options:", reply_markup=extras_keyboard())
     return WAIT_EXTRAS
 
 async def receive_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text
     if txt == "🚀 RUN NOW": return await execute_logic(update, context)
-    # Note: Cancel is handled by Regex filter in conversation handler list below
+    
+    elif txt == "📝 Type Env Vars":
+        await update.message.reply_text(
+            "📝 **Type your Environment Variables below.**\n\n"
+            "Format:\n"
+            "`TOKEN=12345`\n"
+            "`API_KEY=abcdef`\n\n"
+            "_Send them in a single message._",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True)
+        )
+        return WAIT_ENV_TEXT
+
     elif "reqs" in txt:
         await update.message.reply_text("📂 Send `requirements.txt`.")
         context.user_data['wait'] = 'req'
     elif ".env" in txt:
-        await update.message.reply_text("🔒 Send `.env`.")
+        await update.message.reply_text("🔒 Send `.env` file.")
         context.user_data['wait'] = 'env'
+    return WAIT_EXTRAS
+
+async def receive_env_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🔙 Cancel": return await cancel(update, context)
+    
+    target_id = context.user_data['target_id']
+    work_dir = context.user_data['work_dir']
+    
+    # Determine .env path
+    prefix = target_id if context.user_data['type'] == 'file' else target_id.split("|")[0]
+    if context.user_data['type'] == 'repo':
+        env_path = os.path.join(work_dir, ".env")
+    else:
+        env_path = os.path.join(work_dir, f"{prefix}.env")
+        
+    # Append to .env file
+    try:
+        with open(env_path, "a") as f:
+            if os.path.getsize(env_path) > 0:
+                f.write("\n") # Ensure new line if file not empty
+            f.write(text)
+        await update.message.reply_text("✅ **Variables Saved!**\nAdd more or Run.", reply_markup=extras_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error saving env: {e}", reply_markup=extras_keyboard())
+        
     return WAIT_EXTRAS
 
 async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -221,11 +269,11 @@ async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("✅ Env saved.")
     
     context.user_data['wait'] = None
-    await update.message.reply_text("Next?", reply_markup=ReplyKeyboardMarkup([["➕ Add reqs", "➕ Add .env"], ["🚀 RUN NOW", "🔙 Cancel"]], resize_keyboard=True))
+    await update.message.reply_text("Next?", reply_markup=extras_keyboard())
     return WAIT_EXTRAS
 
 # --- CONVERSATION 2: GIT CLONE ---
-WAIT_URL, WAIT_SELECT_FILE = range(2, 4)
+WAIT_URL, WAIT_SELECT_FILE = range(3, 5)
 
 @restricted
 async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,7 +282,7 @@ async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
-    # Note: Cancel is handled by Regex filter in conversation handler list below
+    if url == "🔙 Cancel": return await cancel(update, context)
 
     if not url.startswith("http"): return await update.message.reply_text("❌ Invalid URL.")
     
@@ -446,6 +494,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Contact the dev: @platoonleaderr\n\n"
         "• **Upload File:** Host a single .py file.\n"
         "• **Git Clone:** Host a repo from a public URL.\n"
+        "• **Env Vars:** You can now type them directly!\n"
         "• **Manage:** Stop/Delete/Run your scripts.",
         parse_mode="Markdown"
     )
@@ -476,29 +525,33 @@ if __name__ == '__main__':
     
     app_bot = ApplicationBuilder().token(TOKEN).build()
     
-    # Upload Handler (Fixed Cancel)
+    # Upload Handler
     conv_file = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📤 Upload File$"), upload_start)],
         states={
             WAIT_PY: [
-                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel), # Priority Cancel
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
                 MessageHandler(filters.Document.FileExtension("py"), receive_py)
             ],
             WAIT_EXTRAS: [
-                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel), # Priority Cancel
-                MessageHandler(filters.Regex("^(🚀|➕)"), receive_extras), 
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.Regex("^(🚀|➕|📝)"), receive_extras), 
                 MessageHandler(filters.Document.ALL, receive_extra_files)
+            ],
+            WAIT_ENV_TEXT: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_env_text)
             ]
         },
         fallbacks=[CommandHandler('cancel', cancel), MessageHandler(filters.Regex("^🔙 Cancel$"), cancel)]
     )
 
-    # Git Handler (Fixed Cancel)
+    # Git Handler
     conv_git = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🌐 Clone from Git$"), git_start)],
         states={
             WAIT_URL: [
-                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel), # Priority Cancel
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_git_url)
             ],
             WAIT_SELECT_FILE: [CallbackQueryHandler(select_git_file)]
